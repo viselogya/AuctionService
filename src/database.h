@@ -10,7 +10,7 @@ struct LotCreateParams {
     std::optional<std::string> description;
     double start_price;
     std::optional<std::string> owner_id;
-    std::string auction_end_date;
+    std::optional<std::string> auction_end_date;
 };
 
 struct LotUpdateParams {
@@ -20,6 +20,10 @@ struct LotUpdateParams {
     std::optional<std::string> description;
     bool owner_id_present{false};
     std::optional<std::string> owner_id;
+    bool auction_end_date_present{false};
+    std::optional<std::string> auction_end_date;
+    bool current_price_present{false};
+    std::optional<double> current_price;
 };
 
 class Database {
@@ -34,6 +38,7 @@ public:
     std::optional<nlohmann::json> update_lot(int lot_id, const LotUpdateParams& params);
     bool delete_lot(int lot_id);
     std::optional<nlohmann::json> place_bid(int lot_id, double bid_amount, std::string& error_reason);
+    void check_connection();
 
 private:
     std::string connection_uri_;

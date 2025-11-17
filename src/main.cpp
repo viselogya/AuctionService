@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -159,10 +160,14 @@ int register_service(const std::string& registry_service_url,
     return service_id;
 }
 
-json make_error(const std::string& message) {
-    return json{
+json make_error(const std::string& message, const std::string& code = "") {
+    json error{
         {"error", message}
     };
+    if (!code.empty()) {
+        error["code"] = code;
+    }
+    return error;
 }
 
 void send_json(httplib::Response& res, int status, const json& payload) {
@@ -204,8 +209,51 @@ int main() {
 
         httplib::Server server;
 
+        server.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+            if (req.method == "OPTIONS") {
+                res.status = 200;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        server.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        });
+
         server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-            send_json(res, 200, json{{"status", "ok"}});
+            json response{
+                {"status", "healthy"},
+                {"service", kServiceName},
+                {"timestamp", std::time(nullptr)}
+            };
+            send_json(res, 200, response);
+        });
+
+        server.Get("/ready", [&database](const httplib::Request&, httplib::Response& res) {
+            try {
+                database.check_connection();
+                json response{
+                    {"status", "ready"},
+                    {"database", "connected"},
+                    {"timestamp", std::time(nullptr)}
+                };
+                send_json(res, 200, response);
+            } catch (const std::exception& ex) {
+                json response{
+                    {"status", "not ready"},
+                    {"database", "disconnected"},
+                    {"error", ex.what()},
+                    {"timestamp", std::time(nullptr)}
+                };
+                send_json(res, 503, response);
+            }
         });
 
         server.Get("/lots", [&database](const httplib::Request&, httplib::Response& res) {
@@ -213,26 +261,26 @@ int main() {
                 auto lots = database.get_all_lots();
                 send_json(res, 200, lots);
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 
         server.Get(R"(/lots/(\d+))", [&database](const httplib::Request& req, httplib::Response& res) {
             auto lot_id = parse_path_id(req);
             if (!lot_id) {
-                send_json(res, 400, make_error("Invalid lot id"));
+                send_json(res, 400, make_error("Invalid lot id", "INVALID_LOT_ID"));
                 return;
             }
 
             try {
                 auto lot = database.get_lot_by_id(*lot_id);
                 if (!lot) {
-                    send_json(res, 404, make_error("Lot not found"));
+                    send_json(res, 404, make_error("Lot not found", "LOT_NOT_FOUND"));
                     return;
                 }
                 send_json(res, 200, *lot);
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 
@@ -242,13 +290,41 @@ int main() {
             std::string token_error;
             auto token = extract_bearer_token(req, token_error);
             if (!token) {
-                send_json(res, 401, make_error(token_error));
+                std::string code;
+                if (token_error == "Authorization header is required") {
+                    code = "AUTH_HEADER_REQUIRED";
+                } else if (token_error == "Authorization header must use Bearer scheme") {
+                    code = "AUTH_SCHEME_INVALID";
+                } else if (token_error == "Bearer token must not be empty") {
+                    code = "AUTH_TOKEN_EMPTY";
+                } else {
+                    code = "AUTH_ERROR";
+                }
+                send_json(res, 401, make_error(token_error, code));
                 return std::nullopt;
             }
 
             auto validation = check_token(payment_service_url, method_name, *token);
             if (!validation.allowed) {
-                send_json(res, validation.http_status, make_error(validation.message));
+                std::string code;
+                switch (validation.http_status) {
+                    case 401:
+                        code = "TOKEN_INVALID";
+                        break;
+                    case 403:
+                        code = "ACCESS_DENIED";
+                        break;
+                    case 502:
+                        code = "PAYMENT_SERVICE_ERROR";
+                        break;
+                    case 500:
+                        code = "TOKEN_CHECK_FAILED";
+                        break;
+                    default:
+                        code = "TOKEN_CHECK_FAILED";
+                        break;
+                }
+                send_json(res, validation.http_status, make_error(validation.message, code));
                 return std::nullopt;
             }
             return token;
@@ -261,31 +337,76 @@ int main() {
 
             try {
                 auto payload = json::parse(req.body);
-                if (!payload.contains("name") || !payload.contains("start_price") || !payload.contains("auction_end_date")) {
-                    send_json(res, 400, make_error("Missing required fields: name, start_price, auction_end_date"));
+                if (!payload.contains("name") || !payload.contains("start_price")) {
+                    send_json(res, 400, make_error("Missing required fields: name, start_price", "MISSING_REQUIRED_FIELDS"));
                     return;
                 }
 
+                if (payload["name"].is_null() || !payload["name"].is_string()) {
+                    send_json(res, 400, make_error("Field 'name' must be a non-empty string", "INVALID_FIELD_TYPE"));
+                    return;
+                }
+
+                if (!payload["start_price"].is_number()) {
+                    send_json(res, 400, make_error("Field 'start_price' must be a number", "INVALID_FIELD_TYPE"));
+                    return;
+                }
+
+                auto name_value = payload["name"].get<std::string>();
+                if (name_value.empty()) {
+                    send_json(res, 400, make_error("Field 'name' must not be empty", "INVALID_FIELD_VALUE"));
+                    return;
+                }
+
+                std::optional<std::string> description;
+                if (payload.contains("description") && !payload["description"].is_null()) {
+                    if (!payload["description"].is_string()) {
+                        send_json(res, 400, make_error("Field 'description' must be a string", "INVALID_FIELD_TYPE"));
+                        return;
+                    }
+                    description = payload["description"].get<std::string>();
+                }
+
+                std::optional<std::string> owner_id;
+                if (payload.contains("owner_id") && !payload["owner_id"].is_null()) {
+                    if (!payload["owner_id"].is_string()) {
+                        send_json(res, 400, make_error("Field 'owner_id' must be a string", "INVALID_FIELD_TYPE"));
+                        return;
+                    }
+                    owner_id = payload["owner_id"].get<std::string>();
+                }
+
+                std::optional<std::string> auction_end_date;
+                if (payload.contains("auction_end_date")) {
+                    if (payload["auction_end_date"].is_null()) {
+                        auction_end_date = std::nullopt;
+                    } else if (!payload["auction_end_date"].is_string()) {
+                        send_json(res, 400, make_error("Field 'auction_end_date' must be a string or null", "INVALID_FIELD_TYPE"));
+                        return;
+                    } else {
+                        auto value = payload["auction_end_date"].get<std::string>();
+                        if (!value.empty()) {
+                            auction_end_date = value;
+                        }
+                    }
+                }
+
                 LotCreateParams params{
-                    payload["name"].get<std::string>(),
-                    payload.contains("description") && !payload["description"].is_null()
-                        ? std::optional<std::string>(payload["description"].get<std::string>())
-                        : std::nullopt,
+                    name_value,
+                    description,
                     payload["start_price"].get<double>(),
-                    payload.contains("owner_id") && !payload["owner_id"].is_null()
-                        ? std::optional<std::string>(payload["owner_id"].get<std::string>())
-                        : std::nullopt,
-                    payload["auction_end_date"].get<std::string>()
+                    owner_id,
+                    auction_end_date
                 };
 
                 auto created = database.create_lot(params);
                 send_json(res, 201, created);
             } catch (const json::parse_error&) {
-                send_json(res, 400, make_error("Invalid JSON payload"));
+                send_json(res, 400, make_error("Invalid JSON payload", "INVALID_JSON"));
             } catch (const json::type_error& ex) {
-                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what()));
+                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what(), "INVALID_FIELD_TYPE"));
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 
@@ -296,7 +417,7 @@ int main() {
 
             auto lot_id = parse_path_id(req);
             if (!lot_id) {
-                send_json(res, 400, make_error("Invalid lot id"));
+                send_json(res, 400, make_error("Invalid lot id", "INVALID_LOT_ID"));
                 return;
             }
 
@@ -308,6 +429,9 @@ int main() {
                     params.name_present = true;
                     if (payload["name"].is_null()) {
                         params.name = std::nullopt;
+                    } else if (!payload["name"].is_string()) {
+                        send_json(res, 400, make_error("Field 'name' must be a string or null", "INVALID_FIELD_TYPE"));
+                        return;
                     } else {
                         params.name = payload["name"].get<std::string>();
                     }
@@ -316,6 +440,9 @@ int main() {
                     params.description_present = true;
                     if (payload["description"].is_null()) {
                         params.description = std::nullopt;
+                    } else if (!payload["description"].is_string()) {
+                        send_json(res, 400, make_error("Field 'description' must be a string or null", "INVALID_FIELD_TYPE"));
+                        return;
                     } else {
                         params.description = payload["description"].get<std::string>();
                     }
@@ -324,23 +451,53 @@ int main() {
                     params.owner_id_present = true;
                     if (payload["owner_id"].is_null()) {
                         params.owner_id = std::nullopt;
+                    } else if (!payload["owner_id"].is_string()) {
+                        send_json(res, 400, make_error("Field 'owner_id' must be a string or null", "INVALID_FIELD_TYPE"));
+                        return;
                     } else {
                         params.owner_id = payload["owner_id"].get<std::string>();
+                    }
+                }
+                if (payload.contains("auction_end_date")) {
+                    params.auction_end_date_present = true;
+                    if (payload["auction_end_date"].is_null()) {
+                        params.auction_end_date = std::nullopt;
+                    } else if (!payload["auction_end_date"].is_string()) {
+                        send_json(res, 400, make_error("Field 'auction_end_date' must be a string or null", "INVALID_FIELD_TYPE"));
+                        return;
+                    } else {
+                        auto value = payload["auction_end_date"].get<std::string>();
+                        if (value.empty()) {
+                            params.auction_end_date = std::nullopt;
+                        } else {
+                            params.auction_end_date = value;
+                        }
+                    }
+                }
+                if (payload.contains("current_price")) {
+                    params.current_price_present = true;
+                    if (payload["current_price"].is_null()) {
+                        params.current_price = std::nullopt;
+                    } else if (!payload["current_price"].is_number()) {
+                        send_json(res, 400, make_error("Field 'current_price' must be a number or null", "INVALID_FIELD_TYPE"));
+                        return;
+                    } else {
+                        params.current_price = payload["current_price"].get<double>();
                     }
                 }
 
                 auto updated = database.update_lot(*lot_id, params);
                 if (!updated) {
-                    send_json(res, 404, make_error("Lot not found"));
+                    send_json(res, 404, make_error("Lot not found", "LOT_NOT_FOUND"));
                     return;
                 }
                 send_json(res, 200, *updated);
             } catch (const json::parse_error&) {
-                send_json(res, 400, make_error("Invalid JSON payload"));
+                send_json(res, 400, make_error("Invalid JSON payload", "INVALID_JSON"));
             } catch (const json::type_error& ex) {
-                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what()));
+                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what(), "INVALID_FIELD_TYPE"));
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 
@@ -351,19 +508,19 @@ int main() {
 
             auto lot_id = parse_path_id(req);
             if (!lot_id) {
-                send_json(res, 400, make_error("Invalid lot id"));
+                send_json(res, 400, make_error("Invalid lot id", "INVALID_LOT_ID"));
                 return;
             }
 
             try {
                 bool deleted = database.delete_lot(*lot_id);
                 if (!deleted) {
-                    send_json(res, 404, make_error("Lot not found"));
+                    send_json(res, 404, make_error("Lot not found", "LOT_NOT_FOUND"));
                     return;
                 }
                 res.status = 204;
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 
@@ -374,14 +531,18 @@ int main() {
 
             auto lot_id = parse_path_id(req);
             if (!lot_id) {
-                send_json(res, 400, make_error("Invalid lot id"));
+                send_json(res, 400, make_error("Invalid lot id", "INVALID_LOT_ID"));
                 return;
             }
 
             try {
                 auto payload = json::parse(req.body);
                 if (!payload.contains("bid_amount")) {
-                    send_json(res, 400, make_error("Missing field: bid_amount"));
+                    send_json(res, 400, make_error("Missing field: bid_amount", "MISSING_BID_AMOUNT"));
+                    return;
+                }
+                if (!payload["bid_amount"].is_number()) {
+                    send_json(res, 400, make_error("Field 'bid_amount' must be a number", "INVALID_FIELD_TYPE"));
                     return;
                 }
                 double bid_amount = payload["bid_amount"].get<double>();
@@ -390,24 +551,24 @@ int main() {
                 auto updated = database.place_bid(*lot_id, bid_amount, error_reason);
                 if (!updated) {
                     if (error_reason == "Lot not found") {
-                        send_json(res, 404, make_error(error_reason));
+                        send_json(res, 404, make_error(error_reason, "LOT_NOT_FOUND"));
                     } else if (error_reason == "Bid must be greater than current price") {
-                        send_json(res, 400, make_error(error_reason));
+                        send_json(res, 400, make_error(error_reason, "BID_TOO_LOW"));
                     } else if (error_reason == "Auction has ended") {
-                        send_json(res, 409, make_error(error_reason));
+                        send_json(res, 409, make_error(error_reason, "AUCTION_ENDED"));
                     } else {
-                        send_json(res, 400, make_error(error_reason));
+                        send_json(res, 400, make_error(error_reason, "BID_ERROR"));
                     }
                     return;
                 }
 
                 send_json(res, 200, *updated);
             } catch (const json::parse_error&) {
-                send_json(res, 400, make_error("Invalid JSON payload"));
+                send_json(res, 400, make_error("Invalid JSON payload", "INVALID_JSON"));
             } catch (const json::type_error& ex) {
-                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what()));
+                send_json(res, 400, make_error(std::string("Invalid field type: ") + ex.what(), "INVALID_FIELD_TYPE"));
             } catch (const std::exception& ex) {
-                send_json(res, 500, make_error(ex.what()));
+                send_json(res, 500, make_error(ex.what(), "INTERNAL_ERROR"));
             }
         });
 

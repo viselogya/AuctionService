@@ -93,14 +93,14 @@ nlohmann::json Database::create_lot(const LotCreateParams& params) {
     auto result = txn.exec_params(
         R"SQL(
             INSERT INTO lots (name, description, start_price, current_price, owner_id, auction_end_date)
-            VALUES ($1, $2, $3, $3, $4, $5)
+            VALUES ($1, $2, $3, $3, $4, COALESCE($5::timestamptz, CURRENT_TIMESTAMP + INTERVAL '7 days'))
             RETURNING *
         )SQL",
         params.name,
         params.description ? params.description->c_str() : pqxx::null(),
         params.start_price,
         params.owner_id ? params.owner_id->c_str() : pqxx::null(),
-        params.auction_end_date
+        params.auction_end_date ? params.auction_end_date->c_str() : pqxx::null()
     );
 
     txn.commit();
@@ -113,7 +113,8 @@ nlohmann::json Database::create_lot(const LotCreateParams& params) {
 }
 
 std::optional<nlohmann::json> Database::update_lot(int lot_id, const LotUpdateParams& params) {
-    if (!params.name_present && !params.description_present && !params.owner_id_present) {
+    if (!params.name_present && !params.description_present && !params.owner_id_present &&
+        !params.auction_end_date_present && !params.current_price_present) {
         return get_lot_by_id(lot_id);
     }
 
@@ -141,6 +142,20 @@ std::optional<nlohmann::json> Database::update_lot(int lot_id, const LotUpdatePa
             updates.emplace_back("owner_id = " + txn.quote(*params.owner_id));
         } else {
             updates.emplace_back("owner_id = NULL");
+        }
+    }
+    if (params.auction_end_date_present) {
+        if (params.auction_end_date) {
+            updates.emplace_back("auction_end_date = " + txn.quote(*params.auction_end_date) + "::timestamptz");
+        } else {
+            updates.emplace_back("auction_end_date = NULL");
+        }
+    }
+    if (params.current_price_present) {
+        if (params.current_price) {
+            updates.emplace_back("current_price = " + pqxx::to_string(*params.current_price));
+        } else {
+            updates.emplace_back("current_price = NULL");
         }
     }
 
@@ -227,5 +242,20 @@ std::optional<nlohmann::json> Database::place_bid(int lot_id, double bid_amount,
 
     txn.commit();
     return row_to_json(update_result[0]);
+}
+
+void Database::check_connection() {
+    pqxx::connection conn(connection_uri_);
+    if (!conn.is_open()) {
+        throw std::runtime_error("Database connection is not open");
+    }
+
+    pqxx::work txn(conn);
+    auto result = txn.exec("SELECT 1");
+    txn.commit();
+
+    if (result.empty()) {
+        throw std::runtime_error("Database connectivity check failed");
+    }
 }
 
